@@ -73,6 +73,10 @@ class Target:
     parent: etree._Element
     ins_author: Optional[str] = None
     ins_date: Optional[str] = None
+    # For "ins" targets: True iff the <w:ins> contains only runs (safe to rebuild).
+    # A counterparty <w:ins> with other children (e.g. a nested <w:del>) would lose
+    # that content on rebuild, so edits touching it are flagged instead.
+    ins_simple: bool = True
 
     @property
     def local_text(self) -> str:
@@ -197,11 +201,15 @@ def _build_targets(p: etree._Element) -> tuple[list[Target], str]:
             flush_zone()
             runs = _ins_runs(child)
             text = "".join(r.text for r in runs)
+            # Simple iff every child is a run (or rPr); otherwise rebuilding the ins
+            # would drop nested content (e.g. an inserted-then-deleted <w:del>).
+            simple = all(c.tag in (W("r"), W("rPr")) for c in child)
             targets.append(Target(
                 kind="ins", runs=runs, v_start=v_pos,
                 anchor_elements=[child], parent=p,
                 ins_author=child.get(W("author")),
                 ins_date=child.get(W("date")),
+                ins_simple=simple,
             ))
             visible_parts.append(text)
             v_pos += len(text)
@@ -365,12 +373,15 @@ def _rPr_at(units: list[tuple[int, int, str, Optional[bytes]]], pos: int) -> Opt
     return units[-1][3]
 
 
-def _rebuild_fragments(local_text: str, runs: list[RunInfo],
-                       accepted: list[tuple[int, int, Edit]]) -> list[Fragment]:
+def _rebuild_fragments(runs: list[RunInfo],
+                       ops: list[tuple[int, int, Optional[str]]]) -> list[Fragment]:
     """Walk the local text once, emitting keep/del/ins fragments in order.
 
-    `accepted` is the already-sorted, non-overlapping list of (start, end, edit)
-    in local coordinates. No edit ever sees a half-modified region.
+    `ops` is the already-sorted, non-overlapping list of (start, end, insert_text)
+    in local coordinates. `insert_text` is the text to insert after deleting
+    [start, end) (None/"" => delete-only). A single edit that straddles several
+    targets contributes one op here per target it touches, with `insert_text` set on
+    only one of them. No op ever sees a half-modified region.
     """
     units: list[tuple[int, int, str, Optional[bytes]]] = []
     pos = 0
@@ -383,14 +394,14 @@ def _rebuild_fragments(local_text: str, runs: list[RunInfo],
 
     fragments: list[Fragment] = []
     cursor = 0
-    for span_start, span_end, edit in accepted:
+    for span_start, span_end, insert_text in ops:
         if cursor < span_start:
             fragments.append(("keep", _slices_for_range(units, cursor, span_start)))
         del_slices = _slices_for_range(units, span_start, span_end)
         if del_slices:
             fragments.append(("del", del_slices))
-        if not edit.is_delete and edit.replace:
-            fragments.append(("ins", edit.replace, _rPr_at(units, span_start)))
+        if insert_text:
+            fragments.append(("ins", insert_text, _rPr_at(units, span_start)))
         cursor = span_end
     if cursor < full_len:
         fragments.append(("keep", _slices_for_range(units, cursor, full_len)))
@@ -479,8 +490,8 @@ def _apply_to_paragraph(p_info: ParagraphInfo, edits: list[Edit],
         for i in range(t.v_start, t.v_end):
             char_target[i] = ti
 
-    # Compute spans against ORIGINAL visible text; assign each to a single target.
-    buckets: dict[int, tuple[Target, list[tuple[int, int, Edit]]]] = {}
+    # Match each edit against the original visible text and record its span.
+    matched: list[tuple[int, int, Edit]] = []
     for e in edits:
         match = find_unique_match(visible, e.find)
         if match is None:
@@ -489,38 +500,55 @@ def _apply_to_paragraph(p_info: ParagraphInfo, edits: list[Edit],
                       else f"find string has {count} matches in paragraph (must be unique)")
             flagged.append(FlaggedEdit(edit=e.to_dict(), reason=reason))
             continue
-        start, end = match
-        owners = {char_target[i] for i in range(start, end)}
-        if -1 in owners or len(owners) != 1:
+        matched.append((match[0], match[1], e))
+
+    # Reject overlapping edits at the paragraph level (so the per-target ops we derive
+    # below are inherently non-overlapping). Earlier-starting edit wins.
+    matched.sort(key=lambda m: (m[0], m[1]))
+    accepted_edits: list[tuple[int, int, Edit]] = []
+    last_end = -1
+    for start, end, e in matched:
+        if start < last_end:
             flagged.append(FlaggedEdit(
                 edit=e.to_dict(),
-                reason="edit spans an existing tracked-change boundary; needs human review",
+                reason="edit span overlaps another edit in the same paragraph",
             ))
             continue
-        ti = owners.pop()
-        target = p_info.targets[ti]
-        local = (start - target.v_start, end - target.v_start, e)
-        buckets.setdefault(ti, (target, []))[1].append(local)
+        accepted_edits.append((start, end, e))
+        last_end = end
 
-    # Apply per target. Different targets are independent; within a target we
-    # sort spans and reject overlaps, then rebuild in a single pass.
-    for target, spans in buckets.values():
-        spans.sort(key=lambda s: (s[0], s[1]))
-        accepted: list[tuple[int, int, Edit]] = []
-        last_end = -1
-        for s, en, e in spans:
-            if s < last_end:
-                flagged.append(FlaggedEdit(
-                    edit=e.to_dict(),
-                    reason="edit span overlaps another edit in the same paragraph",
-                ))
-                continue
-            accepted.append((s, en, e))
-            last_end = en
-        if not accepted:
+    # Decompose each accepted edit into one op per target its span touches. An edit
+    # that straddles a tracked-change boundary thus layers across targets instead of
+    # being flagged. The replacement text attaches to the target containing `start`.
+    # ops_by_target: target index -> list of (local_start, local_end, insert_text|None)
+    ops_by_target: dict[int, list[tuple[int, int, Optional[str]]]] = {}
+    for start, end, e in accepted_edits:
+        covered = sorted({char_target[i] for i in range(start, end)})
+        # Guard: refuse to layer into a counterparty <w:ins> with nested content.
+        if any(p_info.targets[ti].kind == "ins" and not p_info.targets[ti].ins_simple
+               for ti in covered):
+            flagged.append(FlaggedEdit(
+                edit=e.to_dict(),
+                reason="edit touches a complex existing insertion; needs human review",
+            ))
             continue
+        first_ti = char_target[start]
+        insert_text = "" if e.is_delete else e.replace
+        for ti in covered:
+            t = p_info.targets[ti]
+            os_ = max(start, t.v_start)
+            oe_ = min(end, t.v_end)
+            if oe_ <= os_:
+                continue
+            ins_here = insert_text if ti == first_ti else None
+            ops_by_target.setdefault(ti, []).append(
+                (os_ - t.v_start, oe_ - t.v_start, ins_here))
 
-        fragments = _rebuild_fragments(target.local_text, target.runs, accepted)
+    # Rebuild each touched target once, in a single pass over its original text.
+    for ti, ops in ops_by_target.items():
+        target = p_info.targets[ti]
+        ops.sort(key=lambda o: (o[0], o[1]))
+        fragments = _rebuild_fragments(target.runs, ops)
         if target.kind == "editable":
             new_elements = _emit_editable(fragments, id_counter, author, date_str)
         else:  # "ins"

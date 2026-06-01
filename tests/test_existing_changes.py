@@ -134,22 +134,99 @@ def test_delete_inside_counterparty_insertion(tmp_path):
     assert our_ins == []
 
 
-def test_edit_spanning_boundary_is_flagged(tmp_path):
-    """A find that straddles clean text and the counterparty insertion is ambiguous
-    to layer, so it must be flagged, not applied."""
+def test_edit_spanning_boundary_layers(tmp_path):
+    """A find that straddles clean text and the counterparty insertion is layered
+    across both targets (not flagged): our deletion in the editable run, and a nested
+    deletion inside the counterparty <w:ins>. Accept/reject must round-trip.
+    """
     in_path = _doc_with_counterparty_ins(tmp_path)
     doc = Document(in_path)
     paragraphs = extract_paragraphs(doc)
 
-    # 'term: the' spans the leading editable run and the counterparty <w:ins>.
+    # 'term: the' spans the leading editable run ("The term: ") and the first chars of
+    # the counterparty <w:ins> ("the best efforts").
     edits = [Edit(para=0, type="replace", find="term: the", replace="term: those")]
     flagged = apply_edits(doc, paragraphs, edits, author="Michael Ohta")
-    assert len(flagged) == 1
-    assert "boundary" in flagged[0].reason
+    assert flagged == [], flagged
 
-    # Document text unchanged.
-    paragraphs_after = extract_paragraphs(doc)
-    assert paragraphs_after[0].text == "The term: the best efforts apply."
+    out = tmp_path / "straddle.docx"
+    doc.save(out)
+    accepted = _pandoc(out, "accept")
+    rejected = _pandoc(out, "reject")
+    assert "The term: those best efforts apply." in accepted, accepted
+    # reject-all reverts our edit AND the counterparty insertion → pristine original.
+    assert "The term:  apply." in rejected or "The term: apply." in rejected, rejected
+
+    # The deletion of "the" lands nested inside the counterparty-authored <w:ins>.
+    with zipfile.ZipFile(out) as z:
+        root = etree.fromstring(z.read("word/document.xml"))
+    nested = [d for d in root.findall(f".//{_q('del')}")
+              if d.getparent().tag == _q("ins")
+              and d.getparent().get(_q("author")) == "Counterparty"]
+    assert nested, "expected a deletion nested inside the counterparty insertion"
+
+
+def test_delete_spanning_boundary_layers(tmp_path):
+    """A delete that straddles the editable/ins boundary removes text on both sides."""
+    in_path = _doc_with_counterparty_ins(tmp_path)
+    doc = Document(in_path)
+    paragraphs = extract_paragraphs(doc)
+
+    # Delete "term: the best" — spans editable ("term: ") + ins ("the best").
+    edits = [Edit(para=0, type="delete", find="term: the best")]
+    flagged = apply_edits(doc, paragraphs, edits, author="Michael Ohta")
+    assert flagged == [], flagged
+
+    out = tmp_path / "straddle-del.docx"
+    doc.save(out)
+    accepted = _pandoc(out, "accept")
+    rejected = _pandoc(out, "reject")
+    # "term: the best" removed; "efforts apply." remains (pandoc collapses whitespace).
+    assert "efforts apply." in accepted and "best" not in accepted, accepted
+    assert "term:" not in accepted, accepted
+    # reject reverts our deletion AND the counterparty insertion → "The term: apply."
+    assert "The term: apply." in rejected or "The term:  apply." in rejected, rejected
+
+
+def test_edit_across_counterparty_deletion_layers(tmp_path):
+    """An edit whose visible span crosses a counterparty <w:del> (zero visible width)
+    deletes on both sides while leaving their deletion in place."""
+    doc = Document()
+    doc.add_paragraph("seed")
+    body = doc.element.body
+    for p in list(body.findall(_q("p"))):
+        body.remove(p)
+    # Visible text: "Alpha bravo charlie." — "DELETED " is a counterparty deletion
+    # sitting between "Alpha " and "bravo".
+    para_xml = '''
+    <w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:r><w:t xml:space="preserve">Alpha </w:t></w:r>
+      <w:del w:id="30" w:author="Counterparty" w:date="2026-05-01T00:00:00Z">
+        <w:r><w:delText xml:space="preserve">DELETED </w:delText></w:r>
+      </w:del>
+      <w:r><w:t xml:space="preserve">bravo charlie.</w:t></w:r>
+    </w:p>
+    '''
+    body.insert(0, etree.fromstring(para_xml.strip()))
+    in_path = tmp_path / "acrossdel.docx"
+    doc.save(in_path)
+
+    doc = Document(in_path)
+    paragraphs = extract_paragraphs(doc)
+    assert paragraphs[0].text == "Alpha bravo charlie."
+
+    # "Alpha bravo" spans the two editable runs on either side of the counterparty del.
+    edits = [Edit(para=0, type="replace", find="Alpha bravo", replace="Omega delta")]
+    flagged = apply_edits(doc, paragraphs, edits, author="Michael Ohta")
+    assert flagged == [], flagged
+
+    out = tmp_path / "acrossdel-out.docx"
+    doc.save(out)
+    accepted = _pandoc(out, "accept")
+    rejected = _pandoc(out, "reject")
+    assert "Omega delta charlie." in accepted, accepted
+    # reject: our edit reverted AND the counterparty deletion reverted (text back).
+    assert "Alpha DELETED bravo charlie." in rejected, rejected
 
 
 def test_edit_in_clean_run_of_doc_with_changes_still_works(tmp_path):

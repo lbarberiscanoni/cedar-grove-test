@@ -134,9 +134,15 @@ test ESA has 78 insertions / 58 deletions). The pipeline handles this:
   Result: `accept-all` shows our edit applied with their insertion kept; `reject-all`
   reverts everything to the true original. (Verified against pandoc accept/reject.)
 - **Edits that straddle a tracked-change boundary** (part on clean text, part on an
-  existing insertion, or across an existing deletion) are **flagged**, not guessed —
-  layering them is ambiguous, and a silently-wrong legal redline is the worst
-  outcome.
+  existing insertion, or across an existing deletion) are **layered across each side**:
+  the edit is decomposed into one deletion per segment it touches plus a single
+  insertion, so it applies as nested tracked changes instead of being flagged. This is
+  what lets the highest-value clauses (output ownership, subprocessor, termination,
+  indemnity) — the ones the counterparty already redlined — get redlined rather than
+  skipped. Accept/reject round-trip is verified.
+- **What still gets flagged** (never guessed): a `find` that isn't unique, an
+  out-of-range paragraph, two edits that overlap in the same paragraph, and the rare
+  case of an edit touching a counterparty `<w:ins>` that contains nested content.
 
 ## Privacy / ZDR
 
@@ -167,7 +173,8 @@ Before sending real client documents:
 - Clean accepted-version output (the apply-redlines skill produces one); easy to add
   with a `soffice`/`accept-changes` byproduct step.
 - The email trigger (Gmail polling / SendGrid inbound) — wraps `review_bytes`.
-- Map-reduce parallelization by section if cold-review latency becomes a problem.
+- Per-section fan-out (one Claude call per playbook section, merged) for broader
+  coverage — reverted to a single call for now; can return behind an env flag.
 
 ### Web UI MVP limitations
 
@@ -192,9 +199,10 @@ The suite builds fixtures in-process and verifies:
 4. `pandoc --track-changes=accept` yields the edited text; `--track-changes=reject`
    restores the original exactly.
 5. `soffice --headless --convert-to pdf` succeeds (skipped if LibreOffice absent).
-6. **Counterparty-redline cases:** edit inside an existing insertion layers
-   correctly (accept/reject round-trip), boundary-straddling edit is flagged, new
-   change-ids don't collide with existing ones, and the real ESA round-trips.
+6. **Counterparty-redline cases:** an edit inside an existing insertion layers
+   correctly, a boundary-straddling edit layers across both sides (replace and delete),
+   an edit across a counterparty deletion layers, new change-ids don't collide, and the
+   real ESA round-trips — all asserted via accept/reject.
 7. **Server path:** `review_bytes` is filesystem-free and returns valid docx bytes.
 
 Validity (file opens) is necessary but NOT sufficient — the accept/reject and

@@ -89,13 +89,10 @@ def test_review_end_to_end_with_stub(tmp_path):
     assert result.num_flagged == 1
     assert "out of range" in result.flagged[0]["reason"]
 
-    # The playbook system block should be marked for 1h cache TTL.
+    # Single Claude call, with the playbook system block cached for 1h.
     [call] = client.calls
-    system = call["system"]
-    assert any(
-        b.get("cache_control", {}).get("ttl") == "1h"
-        for b in system
-    ), "playbook system block should be cached with 1h TTL"
+    assert any(b.get("cache_control", {}).get("ttl") == "1h"
+               for b in call["system"]), "playbook block should be cached 1h"
 
     # Output paths follow the documented naming convention.
     assert out_docx.name == "contract.redlined.docx"

@@ -81,7 +81,7 @@ class ReviewResult:
 
 @lru_cache(maxsize=1)
 def _load_skill_and_playbook() -> tuple[str, str]:
-    """Read skill + playbook once per process (they are constant across contracts)."""
+    """Read skill + playbook once per process (constant across contracts)."""
     skill = (SKILL_DIR / "SKILL.md").read_text()
     playbook = (SKILL_DIR / "PLAYBOOK.md").read_text()
     return skill, playbook
