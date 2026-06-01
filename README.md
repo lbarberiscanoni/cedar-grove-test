@@ -58,6 +58,54 @@ would kill longer ones. The **free tier cold-starts** (~30–60s) before that ~2
 review, so the first request after idle is slow — use the **starter** plan for
 responsiveness.
 
+### Programmatic API (`POST /api/review`) — for the email/automation trigger
+
+For automated callers (e.g. the email pipeline), use the JSON API instead of the HTML
+form. Send the `.docx` as the raw request body (or a multipart `file` field) and get
+back the redlined file (base64) plus the flagged edits:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
+  -H "X-Filename: contract.docx" \
+  --data-binary @contract.docx \
+  https://<your-app>.onrender.com/api/review
+```
+
+Response:
+
+```json
+{
+  "filename": "contract.redlined.docx",
+  "applied": 15,
+  "flagged_count": 0,
+  "flagged": [ { "edit": { "para": 21, ... }, "reason": "..." } ],
+  "redlined_docx_base64": "UEsDBBQ..."
+}
+```
+
+What an email worker does with it (Python):
+
+```python
+import base64, requests
+
+resp = requests.post(
+    "https://<your-app>.onrender.com/api/review",
+    data=open("contract.docx", "rb").read(),
+    headers={"X-Filename": "contract.docx"},
+    timeout=180,
+)
+out = resp.json()
+with open(out["filename"], "wb") as f:
+    f.write(base64.b64decode(out["redlined_docx_base64"]))
+# ...reply to the email with out["filename"]; route out["flagged"] to a human queue.
+```
+
+If `APP_PASSWORD` is set, add `auth=("api", "<password>")` (Basic auth). Errors return
+`{"error": "..."}` with a 4xx/5xx status. Note: the email trigger could also skip HTTP
+entirely and call `review_bytes()` in-process — the API exists for an out-of-process
+or cross-service caller.
+
 ### Server core (for the future email trigger)
 
 The review logic is filesystem-free and importable, so a trigger (email poll, queue

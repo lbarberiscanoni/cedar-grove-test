@@ -98,6 +98,60 @@ def test_results_page_embeds_the_docx_bytes(client):
     assert client.get("/download/anything").status_code == 404
 
 
+def test_api_review_raw_body_returns_json(client):
+    """POST /api/review with the raw .docx body returns JSON with base64 + flagged."""
+    import base64 as _b64
+    r = client.post("/api/review", data=_docx_bytes(),
+                    content_type="application/octet-stream",
+                    headers={"X-Filename": "vendor-msa.docx"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["filename"] == "vendor-msa.redlined.docx"
+    assert j["applied"] == 1 and j["flagged_count"] == 1
+    assert j["flagged"][0]["edit"]["para"] == 21
+    assert _b64.b64decode(j["redlined_docx_base64"]) == STUB_BYTES
+
+
+def test_api_review_format_docx_returns_raw_file(client):
+    """?format=docx returns the raw .docx (curl -o), flagged edits in headers."""
+    r = client.post("/api/review?format=docx", data=_docx_bytes(),
+                    content_type="application/octet-stream",
+                    headers={"X-Filename": "vendor-msa.docx"})
+    assert r.status_code == 200
+    assert r.data == STUB_BYTES
+    assert "wordprocessingml" in r.headers["Content-Type"]
+    assert "vendor-msa.redlined.docx" in r.headers["Content-Disposition"]
+    assert r.headers["X-Applied-Count"] == "1"
+    assert r.headers["X-Flagged-Count"] == "1"
+    assert "needs human review" in r.headers["X-Flagged-Edits"]
+
+
+def test_api_review_multipart_also_works(client):
+    r = client.post("/api/review",
+                    data={"file": (io.BytesIO(_docx_bytes()), "c.docx")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 200
+    assert r.get_json()["filename"] == "c.redlined.docx"
+
+
+def test_api_review_rejects_empty_and_non_docx(client):
+    assert client.post("/api/review", data=b"",
+                       content_type="application/octet-stream").status_code == 400
+    bad = client.post("/api/review", data=b"not a zip",
+                      content_type="application/octet-stream")
+    assert bad.status_code == 400
+    assert "error" in bad.get_json()
+
+
+def test_api_review_requires_password_when_set(monkeypatch):
+    monkeypatch.setattr(app_module, "APP_PASSWORD", "s3cret")
+    monkeypatch.setattr(app_module, "review_bytes", _stub_review_bytes)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    c = app_module.app.test_client()
+    assert c.post("/api/review", data=_docx_bytes(),
+                  content_type="application/octet-stream").status_code == 401
+
+
 def test_non_docx_is_rejected(client):
     data = {"file": (io.BytesIO(b"hello"), "notes.txt")}
     r = client.post("/review", data=data, content_type="multipart/form-data")

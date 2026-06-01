@@ -202,6 +202,83 @@ def do_review():
     )
 
 
+# --- Programmatic API (for the email/automation trigger) ----------------------
+
+
+def _read_api_upload() -> tuple[bytes, str]:
+    """Pull the .docx bytes + filename from an API request.
+
+    Accepts either a multipart `file` field, or the raw request body (e.g.
+    `curl --data-binary @contract.docx`), with the name taken from an optional
+    `X-Filename` header. Raises ValueError with a client-facing message.
+    """
+    f = request.files.get("file")
+    if f is not None and f.filename:
+        name = f.filename
+        data = f.read()
+    else:
+        name = request.headers.get("X-Filename", "contract.docx")
+        data = request.get_data()
+    if not data:
+        raise ValueError("Request body was empty — send a .docx as the body or a "
+                         "multipart 'file' field.")
+    # .docx is a zip; reject obvious non-docx early.
+    if data[:2] != b"PK":
+        raise ValueError("Body does not look like a .docx (zip) file.")
+    return data, name
+
+
+@app.post("/api/review")
+def api_review():
+    """JSON API: send a .docx, get the redlined .docx (base64) + flagged edits.
+
+    This is the entry point the email pipeline calls. Returns:
+      { "filename", "applied", "flagged_count", "flagged": [...],
+        "redlined_docx_base64": "..." }
+    Errors return { "error": "..." } with a 4xx/5xx status.
+    """
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return {"error": "Server is missing ANTHROPIC_API_KEY."}, 500
+    try:
+        data, name = _read_api_upload()
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+
+    try:
+        result = review_bytes(data)
+    except anthropic.APIError as exc:
+        logger.exception("Claude API error during review")
+        return {"error": f"Claude API error: {exc}"}, 502
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("review failed")
+        return {"error": f"Could not process this document: {exc}"}, 500
+
+    logger.info("api review complete: applied=%d flagged=%d",
+                result.num_applied, result.num_flagged)
+
+    download_name = f"{Path(name).stem}.redlined.docx"
+
+    # `?format=docx` returns the raw redlined .docx (so `curl -o out.docx` works),
+    # with the flagged edits in response headers. Default is self-contained JSON.
+    if request.args.get("format") == "docx":
+        return Response(
+            result.redlined_bytes, mimetype=DOCX_CT, headers={
+                "Content-Disposition": f'attachment; filename="{download_name}"',
+                "X-Applied-Count": str(result.num_applied),
+                "X-Flagged-Count": str(result.num_flagged),
+                "X-Flagged-Edits": app.json.dumps(result.flagged),
+            },
+        )
+
+    return {
+        "filename": download_name,
+        "applied": result.num_applied,
+        "flagged_count": result.num_flagged,
+        "flagged": result.flagged,
+        "redlined_docx_base64": base64.b64encode(result.redlined_bytes).decode("ascii"),
+    }
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
