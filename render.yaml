@@ -1,0 +1,19 @@
+# Render Blueprint. In Render: New + → Blueprint → connect this repo.
+# Set ANTHROPIC_API_KEY (and optionally APP_PASSWORD) as secrets in the dashboard.
+services:
+  - type: web
+    name: cedar-grove-redline
+    runtime: python
+    plan: starter            # free tier cold-starts add ~30-60s before a ~26s review
+    buildCommand: pip install -r requirements.txt
+    # --timeout 120 is required: a review takes ~26s and gunicorn's default 30s
+    # worker timeout would kill longer ones. --workers 1 keeps the in-memory
+    # download store consistent (see README "Limitations").
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false           # set as a secret in the dashboard
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      # Optional: set APP_PASSWORD in the dashboard to gate the site behind Basic Auth.

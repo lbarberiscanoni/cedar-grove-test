@@ -1,0 +1,11 @@
+# Pinned for reproducible server builds. Bump deliberately.
+python-docx==1.2.0
+lxml==6.1.1
+anthropic==0.105.2
+
+# Web layer (Render):
+flask==3.1.3
+gunicorn==26.0.0
+
+# Test-only (not needed at runtime on the server):
+pytest==9.0.3
