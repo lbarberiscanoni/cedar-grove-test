@@ -6,10 +6,11 @@ services:
     runtime: python
     plan: starter            # free tier cold-starts add ~30-60s before a ~26s review
     buildCommand: pip install -r requirements.txt
-    # --timeout 120 is required: a review takes ~26s and gunicorn's default 30s
-    # worker timeout would kill longer ones. --workers 1 keeps the in-memory
-    # download store consistent (see README "Limitations").
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 app:app
+    # --timeout 120 is required: a review takes ~30-60s and gunicorn's default 30s
+    # worker timeout would kill it. The app is fully stateless (the redlined file is
+    # embedded in the results page, not stored server-side), so workers can scale and
+    # recycle freely. --max-requests recycles the worker periodically to bound memory.
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --max-requests 100 --max-requests-jitter 20 app:app
     healthCheckPath: /healthz
     envVars:
       - key: ANTHROPIC_API_KEY

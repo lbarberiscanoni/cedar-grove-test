@@ -43,7 +43,6 @@ def client(monkeypatch):
     monkeypatch.setattr(app_module, "review_bytes", _stub_review_bytes)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     app_module.app.config.update(TESTING=True)
-    app_module._DOWNLOADS.clear()
     return app_module.app.test_client()
 
 
@@ -68,34 +67,35 @@ def test_index_shows_upload_form(client):
     assert b'name="file"' in r.data
 
 
-def test_review_returns_results_page_and_download_link(client):
+def test_review_returns_results_page_with_download(client):
     data = {"file": (io.BytesIO(_docx_bytes()), "contract.docx")}
     r = client.post("/review", data=data, content_type="multipart/form-data")
     assert r.status_code == 200
     body = r.data.decode()
     assert "1</strong> edit applied" in body or "1</strong>" in body
     assert "flagged for human review" in body
-    assert "/download/" in body
+    # Download is client-side (no server token route); a button + embedded file.
+    assert 'id="dl"' in body
+    assert "contract.redlined.docx" in body
     # Flagged row rendered.
     assert "needs human review" in body
     assert "21" in body
 
 
-def test_download_returns_docx_bytes(client):
+def test_results_page_embeds_the_docx_bytes(client):
+    """The redlined .docx is embedded (base64) in the page — no server-side store, so
+    nothing to 404 after a worker restart/redeploy."""
+    import base64 as _b64
+    import re
+
     data = {"file": (io.BytesIO(_docx_bytes()), "contract.docx")}
     r = client.post("/review", data=data, content_type="multipart/form-data")
-    token = next(iter(app_module._DOWNLOADS))
-    assert f"/download/{token}".encode() in r.data
-
-    d = client.get(f"/download/{token}")
-    assert d.status_code == 200
-    assert d.data == STUB_BYTES
-    assert "wordprocessingml" in d.headers["Content-Type"]
-    assert "contract.redlined.docx" in d.headers["Content-Disposition"]
-
-
-def test_download_unknown_token_404(client):
-    assert client.get("/download/deadbeef").status_code == 404
+    body = r.data.decode()
+    m = re.search(r'<script id="docx"[^>]*>([^<]+)</script>', body)
+    assert m, "expected an embedded base64 docx block"
+    assert _b64.b64decode(m.group(1).strip()) == STUB_BYTES
+    # No stateful download route exists anymore.
+    assert client.get("/download/anything").status_code == 404
 
 
 def test_non_docx_is_rejected(client):

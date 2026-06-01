@@ -6,6 +6,10 @@ returns a summary + the flagged edits + a download for the redlined .docx. This 
 thin layer over `review.review_bytes()` — all the real work lives in the review core,
 which is stateless and filesystem-free.
 
+The redlined file is embedded in the results page (base64) and downloaded client-side
+via a Blob, so there is NO server-side state to lose — downloads survive worker
+restarts, redeploys, and multi-instance routing on Render.
+
 Run locally:
     ANTHROPIC_API_KEY=sk-... python app.py            # dev server
     ANTHROPIC_API_KEY=sk-... gunicorn --bind 0.0.0.0:8000 --timeout 120 app:app
@@ -16,22 +20,14 @@ environment variables in the dashboard.
 
 from __future__ import annotations
 
+import base64
 import hmac
 import logging
 import os
-import time
-import uuid
 from pathlib import Path
 
-from flask import (
-    Flask,
-    Response,
-    abort,
-    render_template_string,
-    request,
-)
-
 import anthropic
+from flask import Flask, Response, render_template_string, request
 
 from review import review_bytes
 
@@ -39,21 +35,10 @@ logger = logging.getLogger("cedar_grove.app")
 
 DOCX_CT = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024          # 25 MB
-DOWNLOAD_TTL_SECONDS = 30 * 60               # 30 min
 APP_PASSWORD = os.getenv("APP_PASSWORD")     # unset => open access (per design)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
-
-# In-memory download store: token -> {"data": bytes, "name": str, "ts": float}.
-# Single-instance / single-worker MVP store. See README "Limitations".
-_DOWNLOADS: dict[str, dict] = {}
-
-
-def _evict_expired() -> None:
-    cutoff = time.time() - DOWNLOAD_TTL_SECONDS
-    for token in [t for t, v in _DOWNLOADS.items() if v["ts"] < cutoff]:
-        _DOWNLOADS.pop(token, None)
 
 
 # --- Optional Basic Auth ------------------------------------------------------
@@ -101,7 +86,7 @@ _UPLOAD_HTML = """
     <form method="post" action="/review" enctype="multipart/form-data">
       <p><input type="file" name="file" accept=".docx" required></p>
       <p><button class="btn" type="submit">Review contract</button></p>
-      <p class="muted">A review takes ~30 seconds. Don't close the tab.</p>
+      <p class="muted">A review takes ~30–60 seconds. Don't close the tab.</p>
     </form>
   </div>
 </body></html>
@@ -115,13 +100,15 @@ _RESULT_HTML = """
   <div class="card">
     <p><strong>{{ applied }}</strong> edit{{ '' if applied == 1 else 's' }} applied,
        <strong>{{ flagged|length }}</strong> flagged for human review.</p>
-    <p><a class="btn" href="/download/{{ token }}">Download redlined .docx</a></p>
+    <p><button class="btn" id="dl">Download redlined .docx</button></p>
+    <p class="muted" id="dlnote"></p>
   </div>
   {% if flagged %}
   <div class="card">
     <h2 style="font-size:1.1rem">Flagged — needs a human</h2>
-    <p class="muted">These edits could not be applied safely (ambiguous match or they
-    straddle the counterparty's existing tracked changes). Review them by hand.</p>
+    <p class="muted">These edits could not be applied automatically (ambiguous match,
+    or they touch the counterparty's existing tracked changes in a way that needs a
+    human). Review them by hand.</p>
     <table>
       <tr><th>¶</th><th>Severity</th><th>Reason</th><th>Target text</th></tr>
       {% for f in flagged %}
@@ -136,6 +123,28 @@ _RESULT_HTML = """
   </div>
   {% endif %}
   <p><a href="/">← Review another contract</a></p>
+
+  <!-- The redlined file is embedded here and downloaded client-side: no server
+       state, so the download can't 404 after a restart/redeploy. -->
+  <script id="docx" type="application/octet-stream">{{ b64 }}</script>
+  <script>
+    (function () {
+      var b64 = document.getElementById('docx').textContent.trim();
+      var name = {{ name_json|safe }};
+      function download() {
+        var bin = atob(b64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var blob = new Blob([bytes], {type: {{ ct_json|safe }}});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+      }
+      document.getElementById('dl').addEventListener('click', download);
+    })();
+  </script>
 </body></html>
 """
 
@@ -181,32 +190,15 @@ def do_review():
         logger.exception("review failed")
         return _render_upload(f"Could not process this document: {exc}", 500)
 
-    _evict_expired()
-    token = uuid.uuid4().hex
-    stem = Path(file.filename).stem
-    _DOWNLOADS[token] = {
-        "data": result.redlined_bytes,
-        "name": f"{stem}.redlined.docx",
-        "ts": time.time(),
-    }
     logger.info("review complete: applied=%d flagged=%d",
                 result.num_applied, result.num_flagged)
 
+    download_name = f"{Path(file.filename).stem}.redlined.docx"
+    b64 = base64.b64encode(result.redlined_bytes).decode("ascii")
     return render_template_string(
-        _RESULT_HTML, css=_BASE_CSS, name=file.filename, token=token,
-        applied=result.num_applied, flagged=result.flagged,
-    )
-
-
-@app.get("/download/<token>")
-def download(token: str):
-    _evict_expired()
-    entry = _DOWNLOADS.get(token)
-    if entry is None:
-        abort(404)
-    return Response(
-        entry["data"], mimetype=DOCX_CT,
-        headers={"Content-Disposition": f'attachment; filename="{entry["name"]}"'},
+        _RESULT_HTML, css=_BASE_CSS, name=file.filename,
+        name_json=app.json.dumps(download_name), ct_json=app.json.dumps(DOCX_CT),
+        b64=b64, applied=result.num_applied, flagged=result.flagged,
     )
 
 

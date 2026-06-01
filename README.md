@@ -35,7 +35,10 @@ ANTHROPIC_API_KEY=sk-... gunicorn --bind 0.0.0.0:8000 --timeout 120 --workers 1 
 ```
 
 Open <http://localhost:8000>. Routes: `GET /` (form), `POST /review` (process →
-results), `GET /download/<token>` (redlined docx), `GET /healthz`.
+results page with the redlined docx embedded for client-side download), `GET /healthz`.
+The app holds **no server-side state** — the redlined file is embedded in the results
+page and downloaded via a Blob in the browser, so a download can't 404 after a worker
+restart, redeploy, or multi-instance routing.
 
 ## Deploy to Render
 
@@ -43,8 +46,8 @@ results), `GET /download/<token>` (redlined docx), `GET /healthz`.
    GitHub/GitLab (Render deploys from a connected repo).
 2. **Create the service.** In Render: **New + → Blueprint**, point it at the repo. It
    reads [render.yaml](render.yaml) (build = `pip install -r requirements.txt`, start =
-   `gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 app:app`, health check
-   `/healthz`, Python pinned via `.python-version` / `PYTHON_VERSION`).
+   `gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --max-requests 100 app:app`,
+   health check `/healthz`, Python pinned via `.python-version` / `PYTHON_VERSION`).
 3. **Set the secret.** Add `ANTHROPIC_API_KEY` in the dashboard (marked `sync: false`
    in the blueprint so it isn't stored in Git). Optionally set `APP_PASSWORD` to gate
    the whole site behind HTTP Basic Auth — leave it unset for open access.
@@ -186,11 +189,12 @@ Before sending real client documents:
 
 ### Web UI MVP limitations
 
-- **Download store is in-memory, single-worker** (`render.yaml` runs `--workers 1`,
-  ~30-min TTL). A generated file lives only on the worker that made it. Hardening if
-  needed: a shared store (Redis/S3) or returning the file inline.
-- **Synchronous request** (~26s + free-tier cold start). If Render ever kills long
-  requests, the upgrade is an async job + poll.
+- **The results page embeds the redlined .docx** (base64, ~1.3× its size). The review
+  output is small (a few MB), so the page is a few MB — fine on desktop. The benefit:
+  no server-side state, so downloads survive restarts/redeploys/scaling.
+- **Synchronous request** (~30–60s + free-tier cold start). If Render ever kills long
+  requests, the upgrade is an async job + poll. A 502 during a deploy/cold-start is
+  expected (the worker is restarting); it clears once the new worker is up.
 - **Open access** burns API credits for anyone with the URL; set `APP_PASSWORD`.
 
 ## Tests
