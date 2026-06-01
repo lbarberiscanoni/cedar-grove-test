@@ -39,6 +39,7 @@ from redline_engine import (
     FlaggedEdit,
     apply_edits,
     extract_paragraphs,
+    normalize_with_map,
     numbered_text,
 )
 
@@ -52,6 +53,9 @@ MAX_TOKENS = int(os.getenv("CEDAR_GROVE_MAX_TOKENS", "8000"))
 # it changes which edits the model picks but not how many — and adds latency — so it
 # is OFF by default. One of low|medium|high|xhigh|max; empty disables thinking.
 EFFORT = os.getenv("CEDAR_GROVE_EFFORT", "")
+# After the main review, run one extra "completeness" call that sees the edits already
+# made and proposes only what was missed (recall tail). Set 0 to disable.
+COMPLETENESS_PASS = os.getenv("CEDAR_GROVE_COMPLETENESS_PASS", "1") != "0"
 API_TIMEOUT = float(os.getenv("CEDAR_GROVE_API_TIMEOUT", "600"))       # seconds
 API_MAX_RETRIES = int(os.getenv("CEDAR_GROVE_API_MAX_RETRIES", "4"))
 REDLINE_AUTHOR = os.getenv("CEDAR_GROVE_REDLINE_AUTHOR", DEFAULT_AUTHOR)
@@ -131,17 +135,25 @@ def build_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(timeout=API_TIMEOUT, max_retries=API_MAX_RETRIES)
 
 
-def call_claude(numbered_contract: str, skill: str, playbook: str,
-                client: Optional[anthropic.Anthropic] = None) -> list[Edit]:
-    """Call Claude and return parsed edits.
+_MAIN_INSTRUCTION = (
+    "Review the ENTIRE contract below against the playbook — every clause, not only "
+    "the parts the counterparty changed. Per the playbook's sequencing guidance, "
+    "assert Cedar Grove's position wherever it applies: hold every non-negotiable and "
+    "propose every standard fallback as an opening position, including adding or "
+    "strengthening terms where the contract is silent or weaker than the playbook "
+    "requires. Be thorough — surface every applicable edit. Respond with the JSON "
+    "edits object only.\n\n"
+)
+
+
+def _ask(skill: str, playbook: str, user_content: str,
+         client: anthropic.Anthropic, label: str = "claude") -> list[Edit]:
+    """One messages.create with the cached playbook system prompt; returns parsed edits.
 
     Skill + playbook live in the system prompt; the playbook is cached with a 1-hour
-    TTL because it is identical across every contract and the default ephemeral TTL
-    is only 5 minutes.
+    TTL because it is identical across every contract and the default ephemeral TTL is
+    only 5 minutes.
     """
-    if client is None:
-        client = build_client()
-
     system = [
         {"type": "text", "text": skill},
         {
@@ -150,24 +162,11 @@ def call_claude(numbered_contract: str, skill: str, playbook: str,
             "cache_control": {"type": "ephemeral", "ttl": "1h"},
         },
     ]
-
     kwargs = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=system,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Review the ENTIRE contract below against the playbook — every clause, "
-                "not only the parts the counterparty changed. Per the playbook's "
-                "sequencing guidance, assert Cedar Grove's position wherever it "
-                "applies: hold every non-negotiable and propose every standard fallback "
-                "as an opening position, including adding or strengthening terms where "
-                "the contract is silent or weaker than the playbook requires. Be "
-                "thorough — surface every applicable edit. Respond with the JSON edits "
-                "object only.\n\n" + numbered_contract
-            ),
-        }],
+        messages=[{"role": "user", "content": user_content}],
     )
     if EFFORT:
         # Reason first, then answer — in a single call (no tool-use loop). Adaptive
@@ -181,7 +180,7 @@ def call_claude(numbered_contract: str, skill: str, playbook: str,
     usage = getattr(response, "usage", None)
     if usage is not None:
         logger.info(
-            "claude usage: in=%s out=%s cache_read=%s cache_write=%s",
+            "%s usage: in=%s out=%s cache_read=%s cache_write=%s", label,
             getattr(usage, "input_tokens", "?"),
             getattr(usage, "output_tokens", "?"),
             getattr(usage, "cache_read_input_tokens", "?"),
@@ -194,6 +193,36 @@ def call_claude(numbered_contract: str, skill: str, playbook: str,
     if text is None:
         text = next((b.text for b in response.content if hasattr(b, "text")), "")
     return parse_edits(text)
+
+
+def call_claude(numbered_contract: str, skill: str, playbook: str,
+                client: Optional[anthropic.Anthropic] = None) -> list[Edit]:
+    """Main review pass: comprehensive, assertive read of the whole contract."""
+    if client is None:
+        client = build_client()
+    return _ask(skill, playbook, _MAIN_INSTRUCTION + numbered_contract,
+                client, label="claude")
+
+
+def completeness_pass(numbered_contract: str, already: list[Edit], skill: str,
+                      playbook: str, client: anthropic.Anthropic) -> list[Edit]:
+    """Second pass: given the edits already made, propose ONLY the playbook positions
+    that were missed (closes the recall tail). Returns new edits (possibly empty)."""
+    summary = json.dumps(
+        [{"para": e.para, "find": e.find, "comment": e.comment} for e in already],
+        ensure_ascii=False,
+    )
+    content = (
+        "We have ALREADY reviewed this contract against the playbook and proposed the "
+        "edits listed below. Your job is to find what we MISSED: review the same "
+        "contract and playbook and propose ONLY additional edits that assert a playbook "
+        "position not already covered by the edits below. Pay special attention to "
+        "non-negotiables and standard fallbacks the playbook calls for that are absent. "
+        "Do NOT repeat, restate, or lightly reword any edit already made. If nothing is "
+        "missing, return {\"edits\": []}. Respond with the JSON edits object only.\n\n"
+        "EDITS ALREADY MADE (JSON):\n" + summary + "\n\nCONTRACT:\n" + numbered_contract
+    )
+    return _ask(skill, playbook, content, client, label="completeness")
 
 
 # --- Core (server entry points) -----------------------------------------------
@@ -209,9 +238,25 @@ def review_document(doc, client: Optional[anthropic.Anthropic] = None,
     paragraphs = extract_paragraphs(doc)
     logger.info("extracted %d paragraphs", len(paragraphs))
 
+    if client is None:
+        client = build_client()
     skill, playbook = _load_skill_and_playbook()
-    edits = call_claude(numbered_text(paragraphs), skill, playbook, client=client)
-    logger.info("model proposed %d edits", len(edits))
+    numbered = numbered_text(paragraphs)
+
+    edits = call_claude(numbered, skill, playbook, client=client)
+    logger.info("main pass proposed %d edits", len(edits))
+
+    if COMPLETENESS_PASS:
+        try:
+            extra = completeness_pass(numbered, edits, skill, playbook, client)
+        except Exception:  # noqa: BLE001 — never fail the review on the recall pass
+            logger.exception("completeness pass failed; continuing with main edits")
+            extra = []
+        seen = {(e.para, normalize_with_map(e.find)[0]) for e in edits}
+        new = [e for e in extra if (e.para, normalize_with_map(e.find)[0]) not in seen]
+        edits.extend(new)
+        logger.info("completeness pass added %d edits (of %d proposed)",
+                    len(new), len(extra))
 
     flagged = apply_edits(doc, paragraphs, edits, author=author)
     applied = len(edits) - len(flagged)

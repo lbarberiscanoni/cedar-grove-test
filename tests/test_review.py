@@ -50,16 +50,26 @@ def test_parse_edits_defaults():
 
 
 class _StubClient:
-    """Stub anthropic.Anthropic.messages.create() for end-to-end testing."""
+    """Stub anthropic.Anthropic.messages.create() for end-to-end testing.
 
-    def __init__(self, response_text: str):
-        self._text = response_text
+    Accepts a single response string (returned for every call) or a list of strings
+    (returned in order — for testing the main + completeness passes separately).
+    """
+
+    def __init__(self, response_text):
+        self._responses = response_text if isinstance(response_text, list) else None
+        self._text = None if isinstance(response_text, list) else response_text
         self.calls: list[dict] = []
         self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
+        i = len(self.calls)
         self.calls.append(kwargs)
-        return SimpleNamespace(content=[SimpleNamespace(text=self._text)])
+        if self._responses is not None:
+            text = self._responses[min(i, len(self._responses) - 1)]
+        else:
+            text = self._text
+        return SimpleNamespace(content=[SimpleNamespace(text=text)])
 
 
 def _response_two_edits() -> str:
@@ -80,6 +90,7 @@ def test_review_end_to_end_with_stub(tmp_path):
     in_path = tmp_path / "contract.docx"
     doc.save(in_path)
 
+    # Both passes return the same 2 edits; the completeness pass's edits are deduped.
     client = _StubClient(_response_two_edits())
 
     out_docx, out_json, result = review(str(in_path), out_dir=str(tmp_path), client=client)
@@ -89,10 +100,11 @@ def test_review_end_to_end_with_stub(tmp_path):
     assert result.num_flagged == 1
     assert "out of range" in result.flagged[0]["reason"]
 
-    # Single Claude call, with the playbook system block cached for 1h.
-    [call] = client.calls
-    assert any(b.get("cache_control", {}).get("ttl") == "1h"
-               for b in call["system"]), "playbook block should be cached 1h"
+    # Main + completeness pass = two calls, each with the playbook cached for 1h.
+    assert len(client.calls) == 2
+    for call in client.calls:
+        assert any(b.get("cache_control", {}).get("ttl") == "1h"
+                   for b in call["system"]), "playbook block should be cached 1h"
 
     # Output paths follow the documented naming convention.
     assert out_docx.name == "contract.redlined.docx"
@@ -100,6 +112,45 @@ def test_review_end_to_end_with_stub(tmp_path):
 
     flagged_data = json.loads(out_json.read_text())
     assert flagged_data[0]["edit"]["para"] == 99
+
+
+def test_completeness_pass_adds_missed_edits(tmp_path):
+    """The second pass contributes edits the main pass missed; dups are dropped."""
+    doc = Document()
+    doc.add_paragraph("The vendor will use best efforts and provide reports monthly.")
+    in_path = tmp_path / "c.docx"
+    doc.save(in_path)
+
+    main = json.dumps({"edits": [
+        {"para": 0, "type": "replace", "find": "best efforts",
+         "replace": "commercially reasonable efforts", "severity": "high",
+         "comment": "main pass"},
+    ]})
+    completeness = json.dumps({"edits": [
+        {"para": 0, "type": "replace", "find": "best efforts",  # duplicate -> dropped
+         "replace": "commercially reasonable efforts", "severity": "high",
+         "comment": "dup"},
+        {"para": 0, "type": "replace", "find": "monthly",       # new -> added
+         "replace": "quarterly", "severity": "medium", "comment": "missed by main"},
+    ]})
+    client = _StubClient([main, completeness])
+
+    _, _, result = review(str(in_path), out_dir=str(tmp_path), client=client)
+    assert len(client.calls) == 2
+    # 2 unique edits (best efforts + monthly), both applied; no flags.
+    assert result.num_applied == 2
+    assert result.num_flagged == 0
+
+
+def test_completeness_pass_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr("review.COMPLETENESS_PASS", False)
+    doc = Document()
+    doc.add_paragraph("The term is best efforts to deliver.")
+    in_path = tmp_path / "c.docx"
+    doc.save(in_path)
+    client = _StubClient(_response_two_edits())
+    review(str(in_path), out_dir=str(tmp_path), client=client)
+    assert len(client.calls) == 1  # only the main pass
 
 
 def test_review_out_dir_is_respected(tmp_path):

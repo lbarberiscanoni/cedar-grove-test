@@ -141,6 +141,7 @@ production image stays slim.
 | `CEDAR_GROVE_API_TIMEOUT` | `600` | per-request timeout (s) |
 | `CEDAR_GROVE_API_MAX_RETRIES` | `4` | SDK retry count (handles 429/5xx) |
 | `CEDAR_GROVE_EFFORT` | `` (off) | adaptive-thinking effort: low/medium/high/xhigh/max |
+| `CEDAR_GROVE_COMPLETENESS_PASS` | `1` (on) | second recall pass; set `0` to disable |
 | `CEDAR_GROVE_REDLINE_AUTHOR` | `Michael Ohta` | author stamped on tracked changes |
 | `CEDAR_GROVE_SKILL_DIR` | `./skill` | where `SKILL.md` + `PLAYBOOK.md` are mounted |
 | `CEDAR_GROVE_OUTPUT_DIR` | project dir | where CLI writes outputs (also `-o`) |
@@ -176,7 +177,12 @@ server doesn't re-read them per request.
    sees a half-modified region.** Kept/deleted text is split at run-formatting
    boundaries so original formatting (e.g. a bold word mid-sentence) survives;
    insertions inherit the formatting of the first run the span overlaps.
-5. **Round-trip check.** The output bytes are reopened to force an XML parse and
+5. **Completeness pass.** A second Claude call (same cached playbook) sees the edits
+   the main pass already made and proposes ONLY playbook positions it missed; the new
+   ones are deduped against the first set and merged. This closes the recall tail
+   without a tool-use loop. ~2 calls per review (the 2nd hits the playbook cache).
+   Toggle with `CEDAR_GROVE_COMPLETENESS_PASS=0`.
+6. **Round-trip check.** The output bytes are reopened to force an XML parse and
    catch malformed output before returning.
 
 ## Counterparty redlines (documents that already have tracked changes)
