@@ -89,6 +89,7 @@ production image stays slim.
 | `CEDAR_GROVE_MAX_TOKENS` | `8000` | response cap |
 | `CEDAR_GROVE_API_TIMEOUT` | `600` | per-request timeout (s) |
 | `CEDAR_GROVE_API_MAX_RETRIES` | `4` | SDK retry count (handles 429/5xx) |
+| `CEDAR_GROVE_EFFORT` | `` (off) | adaptive-thinking effort: low/medium/high/xhigh/max |
 | `CEDAR_GROVE_REDLINE_AUTHOR` | `Michael Ohta` | author stamped on tracked changes |
 | `CEDAR_GROVE_SKILL_DIR` | `./skill` | where `SKILL.md` + `PLAYBOOK.md` are mounted |
 | `CEDAR_GROVE_OUTPUT_DIR` | project dir | where CLI writes outputs (also `-o`) |
@@ -102,10 +103,17 @@ server doesn't re-read them per request.
    paragraphs inside table cells. The model receives `[¶0] …`, `[¶1] …` and targets
    edits by paragraph number. Extraction and apply share the exact same ordered list
    so indices never drift on schedules / signature blocks.
-2. **Claude call.** Skill + playbook live in the system prompt. The playbook is
-   cached with a 1-hour TTL (`cache_control: {"type":"ephemeral","ttl":"1h"}`)
-   because it's identical across every contract and the default TTL is 5 minutes.
-   The model returns JSON only — see [skill/SKILL.md](skill/SKILL.md).
+2. **Claude call.** Skill + playbook live in the system prompt (the playbook is
+   cached with a 1-hour TTL — `cache_control: {"type":"ephemeral","ttl":"1h"}` —
+   because it's identical across every contract and the default TTL is 5 minutes).
+   A single `messages.create` returns the edits JSON. The per-review user message
+   instructs a *comprehensive* pass — review every clause and assert every applicable
+   playbook position (hold non-negotiables, propose standard fallbacks, add/strengthen
+   where the contract is silent or weaker), relaying the playbook's own sequencing
+   guidance. This is what gives one direct call the breadth of an agentic reviewer
+   without a tool-use loop. (Optional adaptive thinking via `CEDAR_GROVE_EFFORT` is
+   available but off by default — it changes edit *selection*, not breadth, and adds
+   latency.) See [skill/SKILL.md](skill/SKILL.md).
 3. **Validation gate.** Each edit's `find` must occur exactly once in the target
    paragraph (after normalizing smart quotes, em/en dashes, non-breaking spaces, and
    collapsing repeated spaces). Zero matches → flagged. >1 match → flagged.

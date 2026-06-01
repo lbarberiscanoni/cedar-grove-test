@@ -48,6 +48,10 @@ logger = logging.getLogger("cedar_grove.review")
 
 MODEL = os.getenv("CEDAR_GROVE_MODEL", "claude-opus-4-7")
 MAX_TOKENS = int(os.getenv("CEDAR_GROVE_MAX_TOKENS", "8000"))
+# Optional reasoning effort (adaptive thinking) on the single call. Experiment showed
+# it changes which edits the model picks but not how many — and adds latency — so it
+# is OFF by default. One of low|medium|high|xhigh|max; empty disables thinking.
+EFFORT = os.getenv("CEDAR_GROVE_EFFORT", "")
 API_TIMEOUT = float(os.getenv("CEDAR_GROVE_API_TIMEOUT", "600"))       # seconds
 API_MAX_RETRIES = int(os.getenv("CEDAR_GROVE_API_MAX_RETRIES", "4"))
 REDLINE_AUTHOR = os.getenv("CEDAR_GROVE_REDLINE_AUTHOR", DEFAULT_AUTHOR)
@@ -147,18 +151,33 @@ def call_claude(numbered_contract: str, skill: str, playbook: str,
         },
     ]
 
-    response = client.messages.create(
+    kwargs = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=system,
         messages=[{
             "role": "user",
             "content": (
-                "Review the following contract against the playbook. "
-                "Respond with the JSON edits object only.\n\n" + numbered_contract
+                "Review the ENTIRE contract below against the playbook — every clause, "
+                "not only the parts the counterparty changed. Per the playbook's "
+                "sequencing guidance, assert Cedar Grove's position wherever it "
+                "applies: hold every non-negotiable and propose every standard fallback "
+                "as an opening position, including adding or strengthening terms where "
+                "the contract is silent or weaker than the playbook requires. Be "
+                "thorough — surface every applicable edit. Respond with the JSON edits "
+                "object only.\n\n" + numbered_contract
             ),
         }],
     )
+    if EFFORT:
+        # Reason first, then answer — in a single call (no tool-use loop). Adaptive
+        # thinking shares max_tokens with the output, so widen it when enabled.
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": EFFORT}
+        kwargs["max_tokens"] = max(MAX_TOKENS, 32000)
+
+    response = client.messages.create(**kwargs)
+
     usage = getattr(response, "usage", None)
     if usage is not None:
         logger.info(
@@ -168,7 +187,13 @@ def call_claude(numbered_contract: str, skill: str, playbook: str,
             getattr(usage, "cache_read_input_tokens", "?"),
             getattr(usage, "cache_creation_input_tokens", "?"),
         )
-    return parse_edits(response.content[0].text)
+    # With thinking enabled the response carries thinking block(s) before the text;
+    # pull the text block (falling back to the first block that has text).
+    text = next((b.text for b in response.content
+                 if getattr(b, "type", None) == "text"), None)
+    if text is None:
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+    return parse_edits(text)
 
 
 # --- Core (server entry points) -----------------------------------------------
